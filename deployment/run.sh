@@ -54,6 +54,8 @@ Options:
                           prefix containing bin/omc; overrides setup's path
   --require-references    Stop before testing if a selected reference set is
                           unavailable or invalid
+  --resume                Continue an interrupted named run, reusing finalized
+                          model results and executing only unfinished models
   --force                 Forward --execAllTests to test.py
   -h, --help              Show this help
 
@@ -78,6 +80,7 @@ Examples:
   deployment/run.sh master --library Modelica --version 4.1.0 --jobs 2
   deployment/run.sh gbode --library Buildings --version maint.12.x --force
   deployment/run.sh master --library Buildings --version master --jobs 2 --require-references
+  deployment/run.sh master --name interrupted-run --resume
   deployment/run.sh master --omc /opt/openmodelica --library Buildings
   deployment/run.sh ida --compiler-flags "--newBackend" --runtime-flags "-nls=kinsol"
   deployment/run.sh all --jobs 4
@@ -123,6 +126,7 @@ NAME_SET=0
 COMPILER_FLAGS=''
 RUNTIME_FLAGS=''
 FORCE=0
+RESUME=0
 REQUIRE_REFERENCES=0
 OMC_REQUEST=''
 LIBRARY_FILTERS=()
@@ -182,6 +186,10 @@ while (($#)); do
       FORCE=1
       shift
       ;;
+    --resume)
+      RESUME=1
+      shift
+      ;;
     --require-references)
       REQUIRE_REFERENCES=1
       shift
@@ -216,6 +224,18 @@ if [[ "$COMPILER_FLAGS" == *$'\n'* || "$RUNTIME_FLAGS" == *$'\n'* ]]; then
 fi
 if [[ "$JOB" == report && ( -n "$COMPILER_FLAGS" || -n "$RUNTIME_FLAGS" ) ]]; then
   printf 'error: compiler/runtime flags do not apply to the report job\n' >&2
+  exit 2
+fi
+if ((RESUME)) && ((FORCE)); then
+  printf 'error: --resume and --force cannot be used together\n' >&2
+  exit 2
+fi
+if ((RESUME)) && ((NAME_SET == 0)); then
+  printf 'error: --resume requires --name to identify the interrupted run\n' >&2
+  exit 2
+fi
+if ((RESUME)) && [[ "$JOB" == all || "$JOB" == report ]]; then
+  printf 'error: --resume applies to one test job, not %s\n' "$JOB" >&2
   exit 2
 fi
 
@@ -600,7 +620,22 @@ run_one() {
   config=$CONFIG_RESULT
   run_dir="$STATE/runs/$branch"
   mkdir -p "$run_dir"
-  cp -- "$config" "$run_dir/effective-config.json"
+  if ((RESUME)); then
+    [[ -f "$run_dir/effective-config.json" ]] || {
+      printf 'error: cannot resume %s: its saved effective configuration is missing\n' "$branch" >&2
+      return 1
+    }
+    cmp -s -- "$config" "$run_dir/effective-config.json" || {
+      printf 'error: cannot resume %s: the effective configuration has changed\n' "$branch" >&2
+      return 1
+    }
+    [[ -d "$WORK/files" ]] || {
+      printf 'error: cannot resume %s: %s/files is missing\n' "$branch" "$WORK" >&2
+      return 1
+    }
+  else
+    cp -- "$config" "$run_dir/effective-config.json"
+  fi
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   log="$STATE/logs/run-$timestamp-$branch.log"
 
@@ -614,6 +649,7 @@ run_one() {
   )
   [[ -z "$compiler" ]] || command+=("--extraflags=$(omc_expression "$compiler")")
   [[ -z "$runtime" ]] || command+=("--extrasimflags=$runtime")
+  ((RESUME == 0)) || command+=(--resume)
   ((FORCE == 0)) || command+=(--execAllTests)
   command+=("$config")
 

@@ -61,10 +61,11 @@ deployment/run.sh master --library BoundaryInitBlocks --force
 Add `--require-references` to a reference-backed run to stop during preflight
 instead of spending time testing without a usable selected reference set.
 
-After interrupting a run, repeat the same command with `--force`. The upstream
-runner clears its scratch `files` directory, reruns every selected model, and
-replaces that job's published result directory rather than mixing old and new
-HTML output.
+After an interrupted named run, repeat the same command with `--resume`. It
+validates that the effective configuration is unchanged, preserves finalized
+model files in the scratch directory, executes only unfinished models, and then
+publishes the complete result. Use `--force` when a complete rerun is intended;
+it clears the scratch files and executes every selected model.
 
 The predefined jobs are `master`, `gbode`, `cvode`, and `ida`. Their compiler
 and runtime settings match the jobs in `.CI/Jenkinsfile`. `all` runs those four

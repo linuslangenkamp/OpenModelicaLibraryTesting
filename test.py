@@ -40,6 +40,8 @@ parser.add_argument('--default', action='append', help="Add a default value for 
 parser.add_argument('-j', '--jobs', default=0, help="Ignored and deprecated, use procOMC:0 or procOMC:1 in the config")
 parser.add_argument('-v', '--verbose', action="store_true", help="Verbose mode.", default=False)
 parser.add_argument('--execAllTests', action="store_true", help="Force all tests to be executed", default=False)
+parser.add_argument('--resume', action="store_true", default=False,
+                    help="Reuse finalized model results in ./files from an interrupted run")
 parser.add_argument('--noSync', action="store_true", help="Move files using python instead of rsync", default=False)
 parser.add_argument('--timeout', default=0, help="=[value] timeout in seconds for each test, it overrides the timeout calculated by the script")
 parser.add_argument('--msysEnvironment', help = 'MSYS2 environment used by OpenModelica on Windows.',  default = 'ucrt64')
@@ -50,6 +52,7 @@ args = parser.parse_args()
 configs = args.configs
 branch = args.branch
 noSync = args.noSync
+resume = args.resume
 isWin = os.name == 'nt'
 DEBUG = args.debug or False # set this to True for debug output
 
@@ -135,7 +138,11 @@ def print_linenum(signum, frame):
 if not isWin:
   signal.signal(signal.SIGUSR1, print_linenum)
 
-if isWin or noSync:
+if resume and not os.path.isdir("./files"):
+  print("Error: --resume requested, but ./files does not exist")
+  sys.exit(1)
+
+if (isWin or noSync) and not resume:
   # delete temporary ./files to avoid moving of old results (win does not use rsync)
   try:
     rmtree("./files")
@@ -782,6 +789,22 @@ if errorOccurred:
 print("Created .conf.json files")
 sys.stdout.flush()
 
+def hasCompletedResult(test):
+  """Check that runScript, rather than only testmodel.py, finalized the result."""
+  name = test[3]
+  filename = os.path.normpath("files/%s.stat.json" % name)
+  try:
+    with open(filename) as handle:
+      data = json.load(handle)
+    phase = data.get("phase")
+    exectime = data.get("exectime")
+    return (
+      isinstance(phase, int) and 0 <= phase <= 7 and
+      isinstance(exectime, (int, float)) and exectime >= 0
+    )
+  except (OSError, ValueError, TypeError, AttributeError):
+    return False
+
 def runScript(c, timeout, memoryLimit, runverbose):
   j = os.path.normpath("files/%s.stat.json" % c)
   try:
@@ -844,9 +867,9 @@ stop=monotonic()
 print("Querying expected execution time: %s" % friendlyStr(stop-start))
 sys.stdout.flush()
 
-# Cleanup old runs
+# Cleanup old runs unless their finalized model results are being resumed.
 try:
-  if clean:
+  if clean and not resume:
     rmtree("./files")
     print("Cleaned files directory")
 except OSError:
@@ -858,14 +881,21 @@ except OSError:
 print("Created files directory")
 sys.stdout.flush()
 
-numberOfTests = len(tests)
+testsToRun = tests
+if resume:
+  testsToRun = [test for test in tests if not hasCompletedResult(test)]
+  print("Resuming from %d completed tests; %d tests still need execution." %
+        (len(tests) - len(testsToRun), len(testsToRun)))
+  sys.stdout.flush()
 
-if numberOfTests==0:
+numberOfTests = len(testsToRun)
+
+if numberOfTests==0 and not resume:
   print("Everything already up to date. Not executing any tests.")
   sys.exit(0)
 
 
-print("Starting execution of %d tests. Estimated execution time %s (wrong if there are new or few tests).\n" % (numberOfTests, friendlyStr(sum(expectedExec(c) for c in tests)/(1.0*n_jobs))))
+print("Starting execution of %d tests. Estimated execution time %s (wrong if there are new or few tests).\n" % (numberOfTests, friendlyStr(sum(expectedExec(c) for c in testsToRun)/(1.0*n_jobs))))
 sys.stdout.flush()
 cmd_res=[0]
 start=monotonic()
@@ -876,10 +906,11 @@ if n_jobs == 1:
   verbose = 10
 else:
   verbose = 5
-if customTimeout > 0.0:
-  cmd_res=Parallel(n_jobs=n_jobs, verbose=verbose)(delayed(runScript)(name, customTimeout, data["ulimitMemory"], runverbose) for (model,lib,libName,name,data) in tests)
-else:
-  cmd_res=Parallel(n_jobs=n_jobs, verbose=verbose)(delayed(runScript)(name, 2*data["ulimitOmc"]+data["ulimitExe"]+25, data["ulimitMemory"], runverbose) for (model,lib,libName,name,data) in tests)
+if numberOfTests > 0:
+  if customTimeout > 0.0:
+    cmd_res=Parallel(n_jobs=n_jobs, verbose=verbose)(delayed(runScript)(name, customTimeout, data["ulimitMemory"], runverbose) for (model,lib,libName,name,data) in testsToRun)
+  else:
+    cmd_res=Parallel(n_jobs=n_jobs, verbose=verbose)(delayed(runScript)(name, 2*data["ulimitOmc"]+data["ulimitExe"]+25, data["ulimitMemory"], runverbose) for (model,lib,libName,name,data) in testsToRun)
 stop=monotonic()
 print("Execution time: %s" % friendlyStr(stop-start))
 assert(stop-start >= 0.0)
