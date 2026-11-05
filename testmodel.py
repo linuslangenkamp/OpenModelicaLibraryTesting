@@ -56,6 +56,21 @@ def writeResult():
     fp.flush()
     os.fsync(fp.fileno())
 
+modelCache = None
+cachedBuild = None
+buildKey = None
+
+
+def saveModelBuild(parameters=None):
+  if modelCache is None or cachedBuild is not None:
+    return
+  shutil.copy2(errFile, os.path.join(modelCache, "build.err"))
+  temporary = os.path.join(modelCache, "build.json.tmp")
+  with open(temporary, "w") as handle:
+    json.dump({"key": buildKey, "stats": execstat, "parameters": parameters}, handle)
+  os.replace(temporary, os.path.join(modelCache, "build.json"))
+
+
 startJob=monotonic()
 
 def quit_omc(omc):
@@ -73,6 +88,8 @@ def quit_omc(omc):
   return omc
 
 def writeResultAndExit(exitStatus, useOsExit=False, omc=None, omc_new=None):
+  if execstat["phase"] < 5:
+    saveModelBuild()
   writeResult()
   print("Calling exit ...")
   with open(errFile, 'a+') as fp:
@@ -211,18 +228,45 @@ execstat = {
 with open(config) as fp:
   conf = json.load(fp)
 
+if conf.get("modelCache"):
+  if conf["simCodeTarget"] != "C" or conf.get("fmi") or docker:
+    raise ValueError("Model executable reuse requires native C simulations")
+  modelCache = os.path.join(conf["modelCache"], conf["fileName"])
+  buildKey = {key: conf.get(key) for key in (
+    "omhome", "modelName", "fileName", "customCommands", "optlevel", "loadFiles",
+    "libraryLastChange", "defaultTolerance", "defaultNumberOfIntervals", "referenceFile",
+    "environmentTranslation", "environmentSimulation", "ulimitOmc", "ulimitLoadModel",
+    "ulimitMemory", "procCCompile", "omc_thread_cmd")}
+  if os.path.isfile(os.path.join(modelCache, "build.json")):
+    with open(os.path.join(modelCache, "build.json")) as handle:
+      cachedBuild = json.load(handle)
+    if cachedBuild["key"] != buildKey:
+      raise ValueError("Model build inputs changed; use a new comparison name")
+
+modelDirectory = os.path.abspath(conf["fileName"])
+resultDirectory = os.path.abspath("files")
 try:
-  shutil.rmtree(conf["fileName"])
+  shutil.rmtree(modelDirectory)
 except OSError:
   pass
-os.mkdir(conf["fileName"])
-os.chdir(conf["fileName"])
+if modelCache and cachedBuild is None:
+  # Keep the build path valid for binaries with absolute resource or library paths.
+  shutil.rmtree(modelCache, ignore_errors=True)
+  buildDirectory = os.path.join(modelCache, "artifacts")
+  os.makedirs(buildDirectory)
+  os.chdir(buildDirectory)
+else:
+  if cachedBuild is not None and cachedBuild["stats"]["phase"] == 5:
+    shutil.copytree(os.path.join(modelCache, "artifacts"), modelDirectory)
+  else:
+    os.mkdir(modelDirectory)
+  os.chdir(modelDirectory)
 
 dockerExtraArgs = dockerExtraArgs + ["-w", conf["fileName"]]
 
-errFile=os.path.normpath("../files/%s.err" % conf["fileName"])
-simFile=os.path.normpath("../files/%s.sim" % conf["fileName"])
-statFile=os.path.normpath("../files/%s.stat.json" % conf["fileName"])
+errFile=os.path.join(resultDirectory, "%s.err" % conf["fileName"])
+simFile=os.path.join(resultDirectory, "%s.sim" % conf["fileName"])
+statFile=os.path.join(resultDirectory, "%s.stat.json" % conf["fileName"])
 try:
   os.unlink(errFile)
 except OSError:
@@ -253,6 +297,20 @@ if conf.get("fmi"):
       fp.write("C FMI runtime not supported in this installation (HelloWorld failed or did not respect fileNamePrefix)")
     writeResultAndExit(0)
 
+if cachedBuild is not None:
+  execstat.update(cachedBuild["stats"])
+  execstat["buildCacheHit"] = True
+  execstat["buildReused"] = execstat["phase"] == 5
+  for phase in ("parsing", "frontend", "backend", "simcode", "templates", "build"):
+    execstat[phase] = 0.0
+  with open(errFile, "a+") as handle:
+    handle.write("Reusing model build from %s\n" % modelCache)
+    if execstat["phase"] < 5:
+      with open(os.path.join(modelCache, "build.err")) as previous:
+        handle.write(previous.read())
+  if execstat["phase"] < 5:
+    writeResultAndExit(0)
+
 omhome = conf["omhome"]
 os.environ["OPENMODELICAHOME"] = omhome
 
@@ -264,24 +322,25 @@ def createOmcSessionNew():
     return OMCSessionZMQ()
   else:
     return createOmcSession()
-omc = createOmcSession()
+omc = createOmcSession() if cachedBuild is None else None
 omc_new = createOmcSessionNew()
 
-cmd = 'setCommandLineOptions("%s")' % conf["omc_thread_cmd"]
-if not omc.sendExpression(cmd):
-  raise Exception('Could not send %s' % cmd)
+if cachedBuild is None:
+  cmd = 'setCommandLineOptions("%s")' % conf["omc_thread_cmd"]
+  if not omc.sendExpression(cmd):
+    raise Exception('Could not send %s' % cmd)
 
-try:
-  os.unlink(os.path.normpath("%s.tmpfiles" % conf["fileName"]))
-except:
-  pass
-#cmd = 'setCommandLineOptions("--running-testsuite=%s.tmpfiles")' % conf["fileName"]
-runningTestsuiteFiles = False
-#if omc.sendExpression(cmd):
-#  runningTestsuiteFiles = True
+  try:
+    os.unlink(os.path.normpath("%s.tmpfiles" % conf["fileName"]))
+  except:
+    pass
+  #cmd = 'setCommandLineOptions("--running-testsuite=%s.tmpfiles")' % conf["fileName"]
+  runningTestsuiteFiles = False
+  #if omc.sendExpression(cmd):
+  #  runningTestsuiteFiles = True
 
-# Hide errors for old-school running-testsuite flags...
-omc.sendExpression("getErrorString()", parsed = False)
+  # Hide errors for old-school running-testsuite flags...
+  omc.sendExpression("getErrorString()", parsed = False)
 
 outputFormat="mat"
 referenceVars=[]
@@ -319,185 +378,193 @@ if regularFileExists(compareVarsFile) then
 """
 # print(variableFilter)
 
-for cmd in conf["customCommands"]:
-  omc.sendExpression(str(cmd), parsed = False)
-
-if conf.get("optlevel"):
-  cflags = omc.sendExpression("getCFlags()")
-  cflags = cflags.replace("${MODELICAUSERCFLAGS}","").replace("-O0","").replace("-O1","").replace("-O2","").replace("-O3","").replace("-march=native","").strip()
-  cflags += " " + conf["optlevel"]
-  omc.sendExpression(str("setCFlags(\"%s\")" % cflags), parsed = False)
-
-omc.sendExpression('setModelicaPath("%s")' % (libraries+MSLpath,), parsed = False)
-
-if conf.get("ulimitMemory"):
-  # Use at most 80% of the vmem for the GC heap; some memory will be used for other purposes than the GC itself
-  # Note: Only works on 1.13+ OpenModelica; we still need to ulimit the process for safety
-  omc.sendExpression(str("GC_set_max_heap_size(%d);" % (int(conf["ulimitMemory"]*1024*0.8))), parsed = False)
-
-def loadModels(omc, conf):
-  for f in conf["loadFiles"]:
-    if not sendExpressionTimeout(omc, 'loadFile("%s", uses=false)' % f, conf["ulimitLoadModel"]):
-      writeResultAndExit(0, False, omc, omc_new)
-  loadedFiles = sorted(omc.sendExpression("{getSourceFile(cl) for cl in getClassNames()}"))
-  if sorted(conf["loadFiles"]) != loadedFiles:
-    print("Loaded the wrong files. Expected:\n%s\nActual:\n%s" % ("\n".join(sorted(conf["loadFiles"])), "\n".join(loadedFiles)))
-    sys.exit(1)
-newOMLoaded = False
-def loadLibraryInNewOM():
-  global newOMLoaded
-  if not newOMLoaded:
-    newOMLoaded = True
-    # Broken/old getSimulationOptions; use new one (requires parsing again)
-    assert(ompython_omhome!="")
-    assert(omc_new.sendExpression('setModelicaPath("%s")' % (libraries+MSLpath,)))
-    loadModels(omc_new, conf)
-
-start=monotonic()
-try:
-  loadModels(omc, conf)
-except TimeoutError as e:
-  execstat["parsing"]=monotonic()-start
-  with open(errFile, 'a+') as fp:
-    fp.write("Timeout error for cmd: %s\n%s"%(cmd,str(e)))
-  writeResultAndExit(0, True, omc, omc_new)
-execstat["parsing"]=monotonic()-start
-
-try:
-  classNames = omc.sendExpression('getClassNames()')
-except:
-  classNames = []
-
-for cl in classNames:
-  try:
-    classVersion = omc.sendExpression('getVersion(%s)' % cl)
-  except:
-    classVersion = "unknown"
-  try:
-    classSourceFile = omc.sendExpression('getSourceFile(%s)' % cl)
-  except:
-    classSourceFile = "??? unknown source location"
-  with open(errFile, 'a+') as fp:
-    fp.write("Using package %s with version %s (%s)\n" % (cl, classVersion, classSourceFile))
-
-def sendExpressionOldOrNew(cmd):
-  try:
-    return omc.sendExpression(cmd)
-  except:
-    loadLibraryInNewOM()
-    return omc_new.sendExpression(cmd)
-
-annotationSimFlags=""
-(startTime,stopTime,tolerance,numberOfIntervals,stepSize)=sendExpressionOldOrNew('getSimulationOptions(%s,defaultTolerance=%s,defaultNumberOfIntervals=%s)' % (conf["modelName"], conf["defaultTolerance"], max(conf["defaultNumberOfIntervals"], numberOfIntervalsInReference)))
-if conf["simCodeTarget"]=="C" and sendExpressionOldOrNew('classAnnotationExists(%s, __OpenModelica_simulationFlags)' % conf["modelName"]):
-  for flag in sendExpressionOldOrNew('getAnnotationNamedModifiers(%s,"__OpenModelica_simulationFlags")' % conf["modelName"]):
-    if flag=="The searched annotation name not found":
-      # Old, stupid API
-      continue
-    val=sendExpressionOldOrNew('getAnnotationModifierValue(%s,"__OpenModelica_simulationFlags","%s")' % (conf["modelName"],flag))
-    flagVal=" -noemit -%s=%s" % (flag,val)
-    if shared.simulationAcceptsFlag(flagVal, checkOutput=False, cwd="..", isWin=isWin):
-      annotationSimFlags+=" -%s=%s" % (flag,val)
-    else:
-      with open(errFile, 'a+') as fp:
-        fp.write("Ignoring simflag %s since it seems broken on HelloWorld\n" % flagVal)
-
-# TODO: Detect and handle the case where RT_CLOCK is not available in OMC
-total_before = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_SIMULATE_TOTAL)")
-start=monotonic()
-if conf.get("fmi"):
-  cmd='"" <> buildModelFMU(%s,fileNamePrefix="%s",fmuType="%s",version="%s",platforms={"static"})' % (conf["modelName"],conf["fileName"].replace(".","_"),conf["fmuType"],conf["fmi"])
+if cachedBuild is not None:
+  startTime, stopTime, tolerance, numberOfIntervals, stepSize, annotationSimFlags = cachedBuild["parameters"]
 else:
-  cmd='translateModel(%s,tolerance=%g,outputFormat="%s",numberOfIntervals=%d,variableFilter="%s",fileNamePrefix="%s")' % (conf["modelName"],tolerance,outputFormat,numberOfIntervals,variableFilter,conf["fileName"])
-with open(errFile, 'a+') as fp:
-  fp.write("Running command: %s\n"%(cmd))
-try:
-  res=sendExpressionTimeout(omc, cmd, conf["ulimitOmc"])
-except TimeoutError as e:
-  execstat["frontend"]=monotonic()-start
+  for cmd in conf["customCommands"]:
+    omc.sendExpression(str(cmd), parsed = False)
 
-  with open(errFile, 'a+') as fp:
-    fp.write("Timeout error for cmd: %s\n%s"%(cmd,str(e)))
+  if conf.get("optlevel"):
+    cflags = omc.sendExpression("getCFlags()")
+    cflags = cflags.replace("${MODELICAUSERCFLAGS}","").replace("-O0","").replace("-O1","").replace("-O2","").replace("-O3","").replace("-march=native","").strip()
+    cflags += " " + conf["optlevel"]
+    omc.sendExpression(str("setCFlags(\"%s\")" % cflags), parsed = False)
+
+  omc.sendExpression('setModelicaPath("%s")' % (libraries+MSLpath,), parsed = False)
+
+  if conf.get("ulimitMemory"):
+    # Use at most 80% of the vmem for the GC heap; some memory will be used for other purposes than the GC itself
+    # Note: Only works on 1.13+ OpenModelica; we still need to ulimit the process for safety
+    omc.sendExpression(str("GC_set_max_heap_size(%d);" % (int(conf["ulimitMemory"]*1024*0.8))), parsed = False)
+
+  def loadModels(omc, conf):
+    for f in conf["loadFiles"]:
+      if not sendExpressionTimeout(omc, 'loadFile("%s", uses=false)' % f, conf["ulimitLoadModel"]):
+        writeResultAndExit(0, False, omc, omc_new)
+    loadedFiles = sorted(omc.sendExpression("{getSourceFile(cl) for cl in getClassNames()}"))
+    if sorted(conf["loadFiles"]) != loadedFiles:
+      print("Loaded the wrong files. Expected:\n%s\nActual:\n%s" % ("\n".join(sorted(conf["loadFiles"])), "\n".join(loadedFiles)))
+      sys.exit(1)
+  newOMLoaded = False
+  def loadLibraryInNewOM():
+    global newOMLoaded
+    if not newOMLoaded:
+      newOMLoaded = True
+      # Broken/old getSimulationOptions; use new one (requires parsing again)
+      assert(ompython_omhome!="")
+      assert(omc_new.sendExpression('setModelicaPath("%s")' % (libraries+MSLpath,)))
+      loadModels(omc_new, conf)
+
+  start=monotonic()
+  try:
+    loadModels(omc, conf)
+  except TimeoutError as e:
+    execstat["parsing"]=monotonic()-start
+    with open(errFile, 'a+') as fp:
+      fp.write("Timeout error for cmd: %s\n%s"%(cmd,str(e)))
+    writeResultAndExit(0, True, omc, omc_new)
+  execstat["parsing"]=monotonic()-start
+
+  try:
+    classNames = omc.sendExpression('getClassNames()')
+  except:
+    classNames = []
+
+  for cl in classNames:
     try:
-      name = os.path.normpath(omc._omc_log_file.name)
-      del omc
-      with open(name,"r") as fp2:
-        fp.write("\n\nOMC output: %s" % fp2.read().decode().strip())
+      classVersion = omc.sendExpression('getVersion(%s)' % cl)
     except:
-      pass
+      classVersion = "unknown"
+    try:
+      classSourceFile = omc.sendExpression('getSourceFile(%s)' % cl)
+    except:
+      classSourceFile = "??? unknown source location"
+    with open(errFile, 'a+') as fp:
+      fp.write("Using package %s with version %s (%s)\n" % (cl, classVersion, classSourceFile))
 
-  writeResultAndExit(0, omc, omc_new)
+  def sendExpressionOldOrNew(cmd):
+    try:
+      return omc.sendExpression(cmd)
+    except:
+      loadLibraryInNewOM()
+      return omc_new.sendExpression(cmd)
 
-# See which translateModel phases completed
+  annotationSimFlags=""
+  (startTime,stopTime,tolerance,numberOfIntervals,stepSize)=sendExpressionOldOrNew('getSimulationOptions(%s,defaultTolerance=%s,defaultNumberOfIntervals=%s)' % (conf["modelName"], conf["defaultTolerance"], max(conf["defaultNumberOfIntervals"], numberOfIntervalsInReference)))
+  if conf["simCodeTarget"]=="C" and sendExpressionOldOrNew('classAnnotationExists(%s, __OpenModelica_simulationFlags)' % conf["modelName"]):
+    for flag in sendExpressionOldOrNew('getAnnotationNamedModifiers(%s,"__OpenModelica_simulationFlags")' % conf["modelName"]):
+      if flag=="The searched annotation name not found":
+        # Old, stupid API
+        continue
+      val=sendExpressionOldOrNew('getAnnotationModifierValue(%s,"__OpenModelica_simulationFlags","%s")' % (conf["modelName"],flag))
+      flagVal=" -noemit -%s=%s" % (flag,val)
+      if shared.simulationAcceptsFlag(flagVal, checkOutput=False, cwd=os.path.dirname(modelDirectory), isWin=isWin):
+        annotationSimFlags+=" -%s=%s" % (flag,val)
+      else:
+        with open(errFile, 'a+') as fp:
+          fp.write("Ignoring simflag %s since it seems broken on HelloWorld\n" % flagVal)
 
-execTimeTranslateModel=monotonic()-start
-err        = omc.sendExpression("OpenModelica.Scripting.getErrorString()")
-total      = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_SIMULATE_TOTAL)")-total_before
-buildmodel = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_BUILD_MODEL)")
-templates  = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_TEMPLATES)")
-simcode    = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_SIMCODE)")
-backend    = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_BACKEND)")
-frontend   = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_FRONTEND)")
+  # TODO: Detect and handle the case where RT_CLOCK is not available in OMC
+  total_before = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_SIMULATE_TOTAL)")
+  start=monotonic()
+  if conf.get("fmi"):
+    cmd='"" <> buildModelFMU(%s,fileNamePrefix="%s",fmuType="%s",version="%s",platforms={"static"})' % (conf["modelName"],conf["fileName"].replace(".","_"),conf["fmuType"],conf["fmi"])
+  else:
+    cmd='translateModel(%s,tolerance=%g,outputFormat="%s",numberOfIntervals=%d,variableFilter="%s",fileNamePrefix="%s")' % (conf["modelName"],tolerance,outputFormat,numberOfIntervals,variableFilter,conf["fileName"])
+  with open(errFile, 'a+') as fp:
+    fp.write("Running command: %s\n"%(cmd))
+  try:
+    res=sendExpressionTimeout(omc, cmd, conf["ulimitOmc"])
+  except TimeoutError as e:
+    execstat["frontend"]=monotonic()-start
 
-writeResult()
-omc = quit_omc(omc)
+    with open(errFile, 'a+') as fp:
+      fp.write("Timeout error for cmd: %s\n%s"%(cmd,str(e)))
+      try:
+        name = os.path.normpath(omc._omc_log_file.name)
+        del omc
+        with open(name,"r") as fp2:
+          fp.write("\n\nOMC output: %s" % fp2.read().decode().strip())
+      except:
+        pass
 
-print(execTimeTranslateModel,frontend,backend)
-if backend != -1:
-  execstat["frontend"]=frontend-backend
-  if templates != -1:
-    execstat["backend"]=backend-simcode
-    if simcode != -1:
-      execstat["simcode"]=simcode-templates
-      if templates != -1:
-        execstat["templates"]=templates-max(buildmodel, 0.0)
-        if res:
-          execstat["phase"]=4
+    writeResultAndExit(0, omc, omc_new)
+
+  # See which translateModel phases completed
+
+  execTimeTranslateModel=monotonic()-start
+  err        = omc.sendExpression("OpenModelica.Scripting.getErrorString()")
+  total      = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_SIMULATE_TOTAL)")-total_before
+  buildmodel = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_BUILD_MODEL)")
+  templates  = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_TEMPLATES)")
+  simcode    = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_SIMCODE)")
+  backend    = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_BACKEND)")
+  frontend   = omc.sendExpression("OpenModelica.Scripting.Internal.Time.timerTock(OpenModelica.Scripting.Internal.Time.RT_CLOCK_FRONTEND)")
+
+  writeResult()
+  omc = quit_omc(omc)
+
+  print(execTimeTranslateModel,frontend,backend)
+  if backend != -1:
+    execstat["frontend"]=frontend-backend
+    if templates != -1:
+      execstat["backend"]=backend-simcode
+      if simcode != -1:
+        execstat["simcode"]=simcode-templates
+        if templates != -1:
+          execstat["templates"]=templates-max(buildmodel, 0.0)
+          if res:
+            execstat["phase"]=4
+          else:
+            execstat["phase"]=3
         else:
           execstat["phase"]=3
+          execstat["templates"]=templates
       else:
-        execstat["phase"]=3
-        execstat["templates"]=templates
+        execstat["phase"]=2
+        execstat["simcode"]=simcode
     else:
-      execstat["phase"]=2
-      execstat["simcode"]=simcode
+      execstat["phase"]=1
+      execstat["backend"]=backend
   else:
-    execstat["phase"]=1
-    execstat["backend"]=backend
-else:
-  execstat["phase"]=0
-  execstat["frontend"]=frontend
+    execstat["phase"]=0
+    execstat["frontend"]=frontend
 
-with open(errFile, 'a+') as fp:
-  fp.write(err)
-
-if execstat["phase"] < 4:
-  writeResultAndExit(0, False, omc, omc_new)
-
-start=monotonic()
-try:
-  if conf.get("fmi"):
-    if res:
-      fmuExpectedLocation = "%s.fmu" % conf["fileName"].replace(".","_")
-      execstat["build"] = max(0.0, buildmodel) # Older versions didn't separate translate and build times
-      if not os.path.exists(os.path.normpath(fmuExpectedLocation)):
-        err += "\nFMU was not generated in the expected location: %s" % fmuExpectedLocation
-        execstat["phase"]=4
-        writeResultAndExit(0, False, omc, omc_new)
-      execstat["phase"] = 5
-  else:
-    if isWin:
-      res = checkOutputTimeout("\"%s\\share\\omc\\scripts\\Compile.bat\" %s gcc %s parallel dynamic 24 0" % (conf["omhome"], conf["fileName"], msysEnvironment), conf["ulimitOmc"], conf)
-    else:
-      res = checkOutputTimeout("make -j%s -f %s.makefile" % (conf["procCCompile"], conf["fileName"]), conf["ulimitOmc"], conf)
-
-    execstat["build"] = monotonic()-start
-    execstat["phase"] = 5
-except TimeoutError as e:
-  execstat["build"] = monotonic()-start
   with open(errFile, 'a+') as fp:
-    fp.write(str(e))
-  writeResultAndExit(0, True, omc, omc_new)
+    fp.write(err)
+
+  if execstat["phase"] < 4:
+    writeResultAndExit(0, False, omc, omc_new)
+
+  start=monotonic()
+  try:
+    if conf.get("fmi"):
+      if res:
+        fmuExpectedLocation = "%s.fmu" % conf["fileName"].replace(".","_")
+        execstat["build"] = max(0.0, buildmodel) # Older versions didn't separate translate and build times
+        if not os.path.exists(os.path.normpath(fmuExpectedLocation)):
+          err += "\nFMU was not generated in the expected location: %s" % fmuExpectedLocation
+          execstat["phase"]=4
+          writeResultAndExit(0, False, omc, omc_new)
+        execstat["phase"] = 5
+    else:
+      if isWin:
+        res = checkOutputTimeout("\"%s\\share\\omc\\scripts\\Compile.bat\" %s gcc %s parallel dynamic 24 0" % (conf["omhome"], conf["fileName"], msysEnvironment), conf["ulimitOmc"], conf)
+      else:
+        res = checkOutputTimeout("make -j%s -f %s.makefile" % (conf["procCCompile"], conf["fileName"]), conf["ulimitOmc"], conf)
+
+      execstat["build"] = monotonic()-start
+      execstat["phase"] = 5
+  except TimeoutError as e:
+    execstat["build"] = monotonic()-start
+    with open(errFile, 'a+') as fp:
+      fp.write(str(e))
+    writeResultAndExit(0, True, omc, omc_new)
+
+  saveModelBuild([startTime, stopTime, tolerance, numberOfIntervals, stepSize, annotationSimFlags])
+  if modelCache:
+    shutil.copytree(os.path.join(modelCache, "artifacts"), modelDirectory)
+    os.chdir(modelDirectory)
 
 writeResult()
 # Do the simulation
@@ -505,6 +572,8 @@ writeResult()
 # FMPy generates csv, OMSimulator generates mat (outputFormat)
 fmisimulator = conf.get("fmisimulator")
 resFile = "%s_res.%s" % (conf["fileName"], outputFormat if not shared.isFMPy(fmisimulator) else 'csv')
+if modelCache:
+  resFile = os.path.abspath(resFile).replace("\\", "/")
 
 start=monotonic()
 try:

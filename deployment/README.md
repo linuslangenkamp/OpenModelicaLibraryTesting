@@ -281,8 +281,19 @@ exclusions are the same as the nightly tests. A model/reference failure does not
 stop the matrix; an infrastructure error does, preserving partial reports and
 allowing resume. Speedup compares simulation time on the common completed
 models only. Total execution time also includes failed attempts and timeouts.
-The tool recompiles each model for each solver configuration, as the existing
-library tester does; it does not cache executables across solver runs.
+Each model is translated by OMC and compiled by the C compiler **once per
+compiler revision**, then its executable is reused for every solver configuration.
+The cache lives in `deployment/state/comparisons/NAME/model-cache/{baseline,candidate}/`.
+The original build directory is retained and never used for simulation, so
+initialization failures and runtime
+timeouts do not lose the executable. Completed translation/compilation failures
+are also reused. Interrupted builds without a completed cache record are retried.
+Each solver gets a fresh copy of the build artifacts in its own working directory;
+result files and reference comparisons are never reused. Later solver runs report
+zero compilation time and `build_reused=True` in the CSV. The original build
+cost remains in the first solver's results and the cached build record. The same
+rules apply when resuming an interrupted comparison. These caches belong to the
+pinned comparison and cannot be shared with different inputs or compilers.
 
 The existing tester records the selected reference filename and writes explicit
 timeout diagnostics; configured timeout

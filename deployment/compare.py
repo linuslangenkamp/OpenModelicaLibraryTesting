@@ -211,7 +211,7 @@ def model_results(name):
             "simulation_s": stat.get("sim"),
             "translation_build_s": sum(stat.get(key) or 0 for key in
                                        ("parsing", "frontend", "backend", "simcode", "templates", "build")),
-            "total_s": stat.get("exectime"), "reason": reason,
+            "total_s": stat.get("exectime"), "build_reused": bool(stat.get("buildReused")), "reason": reason,
             "failing_variables": ", ".join((diff or {}).get("vars") or []),
         }
     return result
@@ -221,7 +221,8 @@ def report(manifest, destination):
     rows = []
     summary = ["# Compiler comparison", "", "Exact inputs and commands: `manifest.json`.", "",
                "Times are seconds. Speedup uses only models simulated by both versions; "
-               "timeout costs remain in total execution time.", "",
+               "timeout costs remain in total execution time. Each model is translated and compiled once per "
+               "compiler revision; later solvers reuse that build and report zero compilation time.", "",
                "| Solver | Models before/after | Simulate before/after | Verify before/after | "
                "Common completions | Simulation speedup | Total execution before/after (s) |",
                "|---|---:|---:|---:|---:|---:|---:|"]
@@ -380,6 +381,8 @@ def main():
     save(manifest_path, manifest)
     try:
         for label in ("baseline", "candidate"):
+            model_config = directory / (label + "-libraries.json")
+            save(model_config, [dict(entry, modelCache=str(directory / "model-cache" / label)) for entry in entries])
             for solver, flags in solvers.items():
                 name = f"{args.name}-{label}-{solver}"
                 if name in manifest["completed"]:
@@ -393,7 +396,7 @@ def main():
                 work = directory / "work" / name
                 command = [DEPLOYMENT / "run.sh", "master", "--name", name,
                            "--omc", manifest["compilers"][label]["path"],
-                           "--config", config, "--work-dir", work, "--jobs", args.jobs,
+                           "--config", model_config, "--work-dir", work, "--jobs", args.jobs,
                            "--compiler-flags", args.compiler_flags,
                            "--runtime-flags", flags + " " + args.runtime_flags, "--require-references",
                            "--resume" if args.resume and (work / "files").is_dir() else "--force"]

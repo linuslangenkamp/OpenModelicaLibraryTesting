@@ -103,6 +103,11 @@ install(PROGRAMS omc DESTINATION bin)
             self.assertIn("--resume", calls[3])
             self.assertEqual(len({call[call.index("--work-dir")+1] for call in calls}), 4)
             self.assertTrue(any("radauIIA3" in value for call in calls for value in call))
+            caches = [json.loads(Path(call[call.index("--config")+1]).read_text())[0]["modelCache"] for call in calls]
+            self.assertEqual(caches[0], caches[1])
+            self.assertEqual(caches[2], caches[3])
+            self.assertEqual(caches[3], caches[4])
+            self.assertNotEqual(caches[0], caches[2])
             with (destination / "models.csv").open() as handle:
                 rows = list(csv.DictReader(handle))
             repaired = next(row for row in rows if row["model"] == "Modelica.Repaired")
@@ -150,6 +155,70 @@ install(PROGRAMS omc DESTINATION bin)
                 self.assertEqual(compare.model_results("run")["Test", "Test.Initialization"]["reason"], "timeout")
             finally:
                 compare.RESULTS, compare.STATE = original, original_state
+
+    def test_cached_model_skips_compilers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "files").mkdir()
+            fake = root / "modules"
+            fake.mkdir()
+            (fake / "simplejson.py").write_text("from json import *\n")
+            (fake / "monotonic.py").write_text("from time import monotonic\n")
+            (fake / "psutil.py").write_text("")
+            (fake / "OMPython.py").write_text(
+                "class OMCSessionZMQ:\n"
+                " def __init__(self,**kwargs): pass\n"
+                " def sendExpression(self,*args,**kwargs): raise AssertionError('Compiler must not be called')\n"
+                "OMCSession=FindBestOMCSession=OMCSessionZMQ\n")
+            name = "Test_Model"
+            cache = root / "cache" / name
+            artifacts = cache / "artifacts"
+            artifacts.mkdir(parents=True)
+            executable = artifacts / name
+            executable.write_text("#!/bin/sh\ntest ! -e side-effect || exit 23\ntouch side-effect\necho run >> ../executions\n")
+            executable.chmod(0o755)
+            conf = {"fileName": name, "modelName": "Test.Model", "modelCache": str(cache.parent),
+                    "simCodeTarget": "C", "omhome": str(root), "omc_thread_cmd": "-n=1",
+                    "simFlags": "-s=cvode", "environmentSimulation": [], "ulimitExe": 5}
+            key = {field: conf.get(field) for field in (
+                "omhome", "modelName", "fileName", "customCommands", "optlevel", "loadFiles",
+                "libraryLastChange", "defaultTolerance", "defaultNumberOfIntervals", "referenceFile",
+                "environmentTranslation", "environmentSimulation", "ulimitOmc", "ulimitLoadModel",
+                "ulimitMemory", "procCCompile", "omc_thread_cmd")}
+            metadata = {"key": key, "stats": {"phase": 5, "build": 12, "parsing": 4},
+                        "parameters": [0, 1, 1e-6, 10, .1, ""]}
+            (cache / "build.json").write_text(json.dumps(metadata))
+            (cache / "build.err").write_text("original build diagnostics")
+            config = root / "model.json"
+            config.write_text(json.dumps(conf))
+            environment = dict(os.environ, PYTHONPATH=str(fake), PYTHONDONTWRITEBYTECODE="1")
+            command = [sys.executable, str(HERE.parent / "testmodel.py"), "--libraries", str(root), str(config)]
+            for _ in range(2):
+                result = subprocess.run(command, cwd=root, env=environment, capture_output=True, text=True, timeout=10)
+                status_file = root / "files" / (name + ".stat.json")
+                self.assertTrue(status_file.is_file(), result.stderr + result.stdout)
+                status = json.loads(status_file.read_text())
+                self.assertEqual(status["phase"], 6, result.stderr + result.stdout)
+                self.assertTrue(status["buildReused"])
+                self.assertEqual(status["build"], 0)
+                self.assertEqual(status["parsing"], 0)
+            self.assertEqual((root / "executions").read_text().splitlines(), ["run", "run"])
+            self.assertFalse((artifacts / "side-effect").exists())
+            conf["customCommands"] = ["changed compiler flags"]
+            config.write_text(json.dumps(conf))
+            changed = subprocess.run(command, cwd=root, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertIn("Model build inputs changed", changed.stderr)
+            conf.pop("customCommands")
+            config.write_text(json.dumps(conf))
+            # Cached translation failures also skip OMC and retain their original phase/diagnostics.
+            metadata["stats"]["phase"] = 2
+            (cache / "build.json").write_text(json.dumps(metadata))
+            subprocess.run(command, cwd=root, env=environment, capture_output=True, timeout=10)
+            status = json.loads((root / "files" / (name + ".stat.json")).read_text())
+            self.assertEqual(status["phase"], 2)
+            self.assertTrue(status["buildCacheHit"])
+            self.assertIn("original build diagnostics", (root / "files" / (name + ".err")).read_text())
+            self.assertEqual((root / "executions").read_text().splitlines(), ["run", "run"])
 
     def test_command_timeout(self):
         with tempfile.TemporaryDirectory() as temporary:
