@@ -112,6 +112,7 @@ def sendExpressionTimeout(omc, cmd, timeout):
 
   if thread.is_alive():
     with open(errFile, 'a+') as fp:
+      fp.write("OMC command timed out after %s seconds.\n" % timeout)
       fp.write("Thread is still alive.\n")
       if omc._omc_process.poll() is not None:
         fp.write("OMC died, but the thread is still running? This will end badly. The log-file of omc:\n")
@@ -156,6 +157,9 @@ def checkOutputTimeout(cmd, timeout, conf=None):
           env[e[0]] = e[1]
       res[0] = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, env = env).decode().strip()
     except subprocess.CalledProcessError as e:
+      if not isWin and e.returncode in (-signal.SIGALRM, 128 + signal.SIGALRM):
+        with open(errFile, 'a+') as fp:
+          fp.write("Simulation/build command timed out (SIGALRM).\n")
       outputStr = e.output.decode("utf-8","backslashreplace")
       res[1] = cmd + " " + outputStr
     except Exception as e:
@@ -167,6 +171,8 @@ def checkOutputTimeout(cmd, timeout, conf=None):
   thread.join(timeout)
 
   if thread.is_alive():
+    with open(errFile, 'a+') as fp:
+      fp.write("Simulation/build command timed out after %s seconds.\n" % timeout)
     for process in psutil.Process().children(recursive=True):
       try:
         os.killpg(process.pid, signal.SIGINT)
@@ -299,6 +305,7 @@ if referenceFile=="":
   variableFilter=""
   outputFormat="empty"
   emit_protected=""
+execstat["referenceFile"] = referenceFile
 """TODO:
 compareVarsUri := "modelica://" + /*libraryString*/ "Buildings" + "/Resources/Scripts/OpenModelica/compareVars/#modelName#.mos";
 (compareVarsFile,compareVarsFileMessages) := uriToFilename(compareVarsUri);

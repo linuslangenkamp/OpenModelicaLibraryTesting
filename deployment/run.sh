@@ -47,6 +47,9 @@ Options:
   --version VERSION       Select this version of --library (use default for an
                           entry with no explicit libraryVersion)
   --jobs N                Parallel model tests (default: 2, laptop-safe)
+  --config PATH           Library configuration (default: configs/conf.json)
+  --work-dir PATH         Separate scratch directory, also used for --resume
+  --branches NAMES        Space-separated result names for the report job
   --compiler-flags FLAGS  Append raw OMC flags to the selected preset
   --runtime-flags FLAGS   Append simulation executable flags to the preset
   --name NAME             Result/database name; with all, NAME is a prefix
@@ -129,6 +132,7 @@ FORCE=0
 RESUME=0
 REQUIRE_REFERENCES=0
 OMC_REQUEST=''
+REPORT_BRANCHES=''
 LIBRARY_FILTERS=()
 
 need_value() {
@@ -149,6 +153,21 @@ while (($#)); do
       need_value "$@"
       VERSION=$2
       VERSION_SET=1
+      shift 2
+      ;;
+    --config)
+      need_value "$@"
+      SOURCE_CONFIG=$2
+      shift 2
+      ;;
+    --work-dir)
+      need_value "$@"
+      WORK=$2
+      shift 2
+      ;;
+    --branches)
+      need_value "$@"
+      REPORT_BRANCHES=$2
       shift 2
       ;;
     --jobs)
@@ -206,6 +225,13 @@ while (($#)); do
   esac
 done
 
+[[ -f "$SOURCE_CONFIG" ]] || { printf 'error: configuration is missing: %s\n' "$SOURCE_CONFIG" >&2; exit 2; }
+SOURCE_CONFIG="$(cd -- "$(dirname -- "$SOURCE_CONFIG")" && pwd -P)/$(basename -- "$SOURCE_CONFIG")"
+[[ "$WORK" == /* ]] || WORK="$PWD/$WORK"
+if [[ -n "$REPORT_BRANCHES" && ( "$JOB" != report || "$NAME_SET" == 1 ) ]]; then
+  printf 'error: --branches applies only to report and cannot be combined with --name\n' >&2
+  exit 2
+fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || {
   printf 'error: --jobs must be a positive integer\n' >&2
   exit 2
@@ -402,7 +428,8 @@ def local_reference(reference):
     for prefix, replacement in replacements:
         if reference == prefix or reference.startswith(prefix + "/"):
             return replacement + reference[len(prefix):]
-    return None
+    expanded = os.path.expandvars(reference)
+    return expanded if os.path.isabs(expanded) else None
 
 def validate_buildings_csv_set(path):
     files = []
@@ -717,7 +744,10 @@ make_report() {
 }
 
 if [[ "$JOB" == report ]]; then
-  if ((NAME_SET)); then
+  if [[ -n "$REPORT_BRANCHES" ]]; then
+    read -r -a requested_branches <<< "$REPORT_BRANCHES"
+    branches="$(available_report_branches "${requested_branches[@]}")"
+  elif ((NAME_SET)); then
     branches="$(available_report_branches "$NAME")"
   else
     branches="$(available_report_branches)"

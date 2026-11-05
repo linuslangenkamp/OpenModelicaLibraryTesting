@@ -8,7 +8,7 @@ with a temporary filtered copy of `configs/conf.json`.
 ## Fresh-machine setup
 
 Install Python 3 with `venv`, Git, a C/C++ toolchain, `make`, `tar`, `xz`,
-`timeout`, `diff`, and `flock`, then run:
+`timeout`, `diff`, `ps`, and `flock`, then run:
 
 ```sh
 deployment/setup.sh
@@ -178,3 +178,121 @@ source, and local destination in the inventory. Tests can still run without a
 reference set, but affected models will not be reference-verified. `run.sh`
 omits unusable references only from its temporary config, allowing the existing
 `test.py` to finish and create its standard HTML with verification left empty.
+
+## Compare two compiler revisions
+
+`compare.py` builds two committed OpenModelica revisions and runs the existing
+library tester with the same libraries, references and settings on both. The
+default matrix is **Modelica 4.1.0 and Buildings master (`Buildings_latest`)**,
+using **CVODE and GBODE Radau IIA3**, first on the baseline and then the candidate.
+
+From this repository's `deployment` branch, in a terminal or byobu session:
+
+```sh
+deployment/compare.py \
+  --repo ../OpenModelica \
+  --baseline origin/master \
+  --candidate fix/spatialdistribution/stages \
+  --name spatial \
+  --build-jobs 8 --jobs 8
+```
+
+The source checkout must contain both commits, and they must be different. Add `--fetch` to update `origin`
+before starting, or fetch a PR explicitly and pass its ref/commit as the
+candidate. Uncommitted source changes are not included. The runner creates
+independent clones; it does not switch branches or create Git worktrees in the
+source checkout. Both use `build_cmake`, the `install` target, Release mode,
+and disabled GUI clients, OMSimulator and C++ runtime. Build commands run
+sequentially with at most eight jobs. `--build-root /srv/om-builds` chooses where
+those compiler clones and builds live; `--cmake-arg=-DOPTION=VALUE` adds a CMake
+option equally to both builds. Build dependencies must already be installed.
+
+The first invocation calls `setup.sh` once if deployment has not been set up.
+Otherwise it reuses the installed libraries and reference sets. Do not update
+libraries or run setup during the comparison. Modelica sources, package
+metadata, selected reference files, compiler installations, harness code and
+settings are fingerprinted. Resume rejects changed inputs; moving branch names
+continue to use the original pinned commits.
+
+Useful variations:
+
+```sh
+# CVODE alone, or all four solvers
+deployment/compare.py --repo ../OpenModelica --candidate my-branch \
+  --name cvode-check --solvers cvode
+deployment/compare.py --repo ../OpenModelica --candidate my-branch \
+  --name all-solvers --solvers dassl,ida,cvode,gbode-radauIIA3
+
+# Explicit libraries/versions; --library is repeatable
+deployment/compare.py --repo ../OpenModelica --candidate my-branch \
+  --name buildings-only --library Buildings:master
+
+# Use two existing installations, without building either
+deployment/compare.py --name installed-check \
+  --baseline-omc /srv/master/build_cmake/install_cmake \
+  --candidate-omc /srv/pr/build_cmake/install_cmake
+
+# Resume with the original arguments and name, or regenerate only the tables
+deployment/compare.py --repo ../OpenModelica --candidate my-branch \
+  --name spatial --build-jobs 8 --jobs 8 --resume
+deployment/compare.py --name spatial --report-only
+```
+
+Every compiler/solver combination has separate scratch files and a result name
+such as `spatial-baseline-cvode` or `spatial-candidate-gbode-radauIIA3`. Completed
+combinations are skipped on resume; the interrupted one uses `run.sh --resume`.
+An existing comparison name is never silently overwritten. Defaults allow two
+parallel model tests; `--jobs` accepts 1–8. Per-model compilation remains one
+job, matching the library tester's default. Model translation and simulation
+timeouts come from the selected library config. `--build-timeout` (default two
+hours per command) and `--run-timeout` (default 24 hours per combination) bound
+the orchestration; interrupted commands and their descendants are terminated, including model
+workers that start separate process sessions.
+
+Use `--compiler-flags='...'` and `--runtime-flags='...'` to configure both
+compilers equally. The default compiler flag is `--simCodeTarget=C`; each solver
+uses the neutral `master` preset with an explicit runtime selection, avoiding
+other nightly solver presets. The Radau flags are
+`-s=gbode -gbm=radauIIA3 -gbnls=internal`. Add custom configurations with, for
+example, `--solver 'gbode-esdirk4=-s=gbode -gbm=esdirk4 -gbnls=internal'`.
+`--solvers ''` suppresses the built-in configurations when using only custom
+ones. `--config PATH` selects another library configuration file.
+
+Outputs for `--name spatial`:
+
+| Location | Contents |
+|---|---|
+| `deployment/results/comparisons/spatial/summary.md` | Counts, common-model speedup and paired per-model results |
+| `deployment/results/comparisons/spatial/models.csv` | Paired status, simulation/build/total times, reasons and failing variables |
+| `deployment/results/comparisons/spatial/manifest.json` | Exact commits, flags, compiler versions, fingerprints and completed combinations |
+| `deployment/results/spatial-overview.html` | Existing HTML overview for all selected combinations |
+| `deployment/results/spatial-{baseline,candidate}-SOLVER/` | Existing detailed library reports and diagnostics |
+| `deployment/state/comparisons/spatial/` | Build/test logs, pinned config, resumable scratch files and default compiler builds |
+
+Commands and log locations are printed as they start. Follow the indicated log
+with `tail -f` in another byobu window for detailed compiler/model progress.
+
+"Simulates" means the simulation completed; "verifies" additionally requires
+a successful reference comparison with at least one compared variable. Missing
+per-model references are shown as **no reference**, not verification passes.
+Both runs use the existing native library references and comparison tolerances;
+no references or tolerances are changed. The configured experiment models and
+exclusions are the same as the nightly tests. A model/reference failure does not
+stop the matrix; an infrastructure error does, preserving partial reports and
+allowing resume. Speedup compares simulation time on the common completed
+models only. Total execution time also includes failed attempts and timeouts.
+The tool recompiles each model for each solver configuration, as the existing
+library tester does; it does not cache executables across solver runs.
+
+The existing tester records the selected reference filename and writes explicit
+timeout diagnostics; configured timeout
+limits printed in ordinary logs are not treated as failures.
+
+The deployment wrapper also accepts `--config PATH`, `--work-dir PATH`, and
+`report --branches 'NAME1 NAME2 ...'` independently of the comparison runner.
+
+Run the small offline orchestration tests with:
+
+```sh
+python3 deployment/test_compare.py
+```

@@ -180,6 +180,8 @@ def runCommand(cmd, prefix, timeout):
   gotTimeout = False
 
   if thread.is_alive():
+    with open(os.path.normpath("files/%s.err" % prefix), "a+") as errfile:
+      errfile.write("Library test timed out after %s seconds.\n" % timeout)
     gotTimeout = True
     if isWin:
       os.kill(process[0].pid, signal.SIGTERM)
